@@ -35,6 +35,13 @@ Reading of column-ordered binary tables is untested.
 
 Reading of binary tables with vector elements is untested.
 
+=item *
+
+These classes were not designed as a drop in replacement for
+the STSDAS Table package.  They were designed to simply
+read entire tables as is.  As such the design might
+not scale well.
+
 =back
 
 =head1 LICENSE

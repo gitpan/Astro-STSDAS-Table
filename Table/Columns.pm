@@ -89,7 +89,7 @@ sub byname
   $_[0]->{cols}{$name};
 }
 
-sub idxs
+sub cols
 {
   $_[0]->_mkidxs_s unless defined $_[0]->{idxs_s};
   @{$_[0]->{idxs_s}};
@@ -102,7 +102,7 @@ sub _mkidxs_s
 
 sub names
 {
-  map { $_->name } $_[0]->idxs;
+  map { $_->name } $_[0]->cols;
 }
 
 sub rename
@@ -221,9 +221,9 @@ columns.
 
 return the column with the specified name.
 
-=item idxs
+=item cols
 
-  @cols = $cols->idxs;
+  @cols = $cols->cols;
 
 returns a list of the columns (as B<Astro::STSDAS::Table::Column> objects)
 sorted on column index.

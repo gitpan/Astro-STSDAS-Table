@@ -1,6 +1,6 @@
 use Test::More;
 
-BEGIN{ plan( tests => 21 ) };
+BEGIN{ plan( tests => 22 ) };
 BEGIN{ use_ok( 'Astro::STSDAS::Table::HeaderPars' ) };
 
 my $pars;
@@ -39,6 +39,8 @@ ok( !$@, 'add');
 is( $pars->npars, 2, 'npars' );
 is( $pars->byname( 'p2' ), $p2, 'byname' );
 is( $p2->idx, 2, 'parameter index' );
+
+ok( eq_array( [ $p1, $p2 ], [ $pars->pars ] ), 'pars' );
 
 ok( defined $pars->rename( 'p2', 'p3' ), 'rename' );
 is( $pars->byname( 'p3' ), $p2, 'byname' );

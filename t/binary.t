@@ -1,5 +1,13 @@
 use Test::More;
-BEGIN { plan( tests => 168 ) };
+
+BEGIN {
+  if ( unpack("h*", pack("s", 1)) =~ /^1/ )
+  {
+    plan skip_all => 'No little endian binary tables to test!';  
+  }
+  else
+  { plan( tests => 168 ) }
+};
 
 BEGIN { use_ok( 'Astro::STSDAS::Table::Binary' ) }; 
 
@@ -79,13 +87,13 @@ sub chk_par
   
   while( <PAR> )
   {
-    my $col = $_;
+    my $spar = $_;
     my ( $name , $type, $value ) = 
       map { my $x = $_; $x =~ s/^\s+//; $x =~ s/\s+$//; $x }
     (
-     substr( $col,  0,  8 -  0 + 1 ),
-     substr( $col,  9,  9 -  9 + 1 ),
-     substr( $col, 11 )
+     substr( $spar,  0,  8 -  0 + 1 ),
+     substr( $spar,  9,  9 -  9 + 1 ),
+     substr( $spar, 11 )
     );
     
     $type = $HdrType{ lc $type };

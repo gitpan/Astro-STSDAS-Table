@@ -3,6 +3,6 @@ use ExtUtils::MakeMaker;
 # the contents of the Makefile that is written.
 WriteMakefile(
     'NAME'	=> 'Astro::STSDAS::Table',
-    'VERSION' => '0.11',
+    'VERSION' => '0.13',
     'PREREQ_PM' => { Test::More => 0.42 },
 );

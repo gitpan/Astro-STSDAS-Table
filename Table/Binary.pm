@@ -1,6 +1,6 @@
 package Astro::STSDAS::Table::Binary;
 
-our $VERSION = '0.12';
+our $VERSION = '0.13';
 
 use strict;
 use warnings;
@@ -34,12 +34,15 @@ our @hdr_fields = (
  # row_len  - the row length, in bytes, for row-ordered tables
  # row_used - the actual length of the row in the file, in bytes, for
  #            row-ordered tables
+ # row_els  - the number of elements in a row (includes vector elements)
  # nrows_a  - the number of rows allocated (in a column ordered table)
  # ttype    - the type of table (either TT_ROW_ORDER or TT_COL_ORDER)
  # version  - "table software version number" from STSDAS created tables
  # row      - the next record (zero based) to be read in
  # last_col_idx - index of the last column read, for column ordered tables
  # last_col - the last column read, for column ordered tables
+ # buf      - the input buffer, row_len bytes wide.
+ # have_vecs - the table has vectors
 
 
 sub new
@@ -117,6 +120,7 @@ sub _read_hdr
     }
   }
 
+  $self->{row_els} = 0;
   for my $coln ( 1 .. $rawhdr{ncols} )
   {
     read( $self->{fh}, $buf, 16 * $TypeSize{TY_INT()} ) == 
@@ -149,43 +153,51 @@ sub _read_hdr
 				  $offset * CHAR_SZ,
 				  $type, $nelem );
 
+    $self->{row_els} += $nelem;
 
     $self->{row_extract} .= $col->fmt;
   }
 
   if ( $rawhdr{ncols_a} > $rawhdr{ncols} )
   {
-    my $i = 1;
-    while ( $i++ <= $rawhdr{ncols_a} - $rawhdr{ncols} )
-    {
-      read( $self->{fh}, $buf, 16 * $TypeSize{TY_INT()} ) == 
-	16 * $TypeSize{TY_INT()} or
-	croak( "ran out of data reading padding column definition $i\n" );
-    }
+    my $nbytes = ($rawhdr{ncols_a} - $rawhdr{ncols}) * 16 * $TypeSize{TY_INT()} ;
+    read( $self->{fh}, $buf, $nbytes ) == $nbytes
+	or
+	  croak( "ran out of data reading padding column definitions\n" );
   }
+
+  # reuse buffers for speed (Perl will size them correctly the first time
+  # they're used
+
+  # input raw buffer
+  $self->{buf} = '';
+
+  # input extracted data buffer (inlined vector elements)
+  $self->{data} = [];
+
+  # input data, vector elements split out
+  $self->{row_arr} = [];
+  $self->{row_hash} = {};
+
+  $self->{have_vecs} = grep { $_->is_vector } $self->{cols}->cols;
 }
-
-
-
 
 sub is_row_order { $_[0]->{ttype} == TT_ROW_ORDER }
 sub is_col_order { $_[0]->{ttype} == TT_COL_ORDER }
-
-*read_table = \&read_table_row;
 
 sub read_rows_hash
 {
   my $self = shift;
 
+  # pre extend
   my @rows;
   $#rows = $self->{nrows} - 1;
+  @rows = ();
 
   if ( $self->is_row_order )
   {
-    my $idx = 0;
     my $row;
-    $rows[$idx++] = $row 
-      while ( $row = $self->read_row_row_hash );
+    push @rows, $row while $row = $self->read_row_row_hash( {} ) ;
   }
 
   else
@@ -199,29 +211,32 @@ sub read_rows_hash
 sub read_rows_array
 {
   my $self = shift;
+  my %attr = ( VecSplit => 1, 
+	       ( @_ && 'HASH' eq ref($_[-1]) ? %{pop @_} : () ) );
 
   my @rows;
   $#rows = $self->{nrows} - 1;
+  @rows = ();
 
   if ( $self->is_row_order )
   {
     my $idx = 0;
-    while ( my $row = $self->read_row_row_array )
-    {
-      $rows[$idx++] = $row;
-    }
+    my $row;
+    push @rows, $row
+      while ( $row = $self->read_row_row_array( [], \%attr ) );
   }
 
   else
   {
     # pre extend row arrays.
-    foreach my $idx ( 0..($self->{nrows}-1) )
-    {
-      my @row;
-      $#row = $self->{ncols} - 1;
-      $rows[$idx] = \@row;
-    }
-    1 while $self->read_col_row_array( \@rows );
+    @rows = map {
+                  my @row;
+		  $#row = $self->{ncols} - 1;
+		  @row = ();
+		  \@row;
+		} ( 0..($self->{nrows}-1) );
+
+    1 while $self->read_col_row_array( \@rows, \%attr );
   }
 
   \@rows;
@@ -291,39 +306,73 @@ sub read_col_row_hash
 sub read_col_row_array
 {
   my $self = shift;
+
+  my %attr = ( VecSplit => 1, 
+	       ( @_ && 'HASH' eq ref($_[-1]) ? %{pop @_} : () ) );
+
   my $row = shift;
+  my $col = $self->{last_col};
 
-  my $data = $self->read_col_col_array;
+  my $data = $self->read_col_col_array( \%attr );
 
-  eval qq{
-    use integer;
-    \$row->[\$_][$self->{last_col_idx}] =
-      \$data->[\$_] foreach 0..($self->{nrows}-1) ;
-  };
+  if ( !$self->{have_vecs} || $attr{VecSplit} )
+  {
+    eval qq{
+      use integer;
+      push \@{\$row->[\$_]}, \$data->[\$_] foreach 0..$self->{nrows}-1 ;
+    };
+  }
+
+  else
+  {
+    # make special code; don't know yet if this is worth it
+    my $dp = 0;
+    my $dpd = $col->nelem;
+    my $dpd1 = $col->nelem - 1;
+
+    eval qq{
+      use integer;
+      for my \$idx ( 0..@{\$self->{nrows}}-1 )
+      {
+	push \@{\$row->[\$idx]}, [ \@{\$data}[\$dp .. (\$dp + $dpd1) ] ] ;
+	\$dp += $dpd
+      }
+    };
+    
+  }
+
   1;
 }
 
 sub read_col_col_array
 {
   my $self = shift;
+  my $uattr = shift;
+
+  my %attr = { VecSplit => 1, defined $uattr ? %$uattr : () };
 
   my $data = $self->_read_next_col;
   my $col = $self->{last_col};
 
   # if there are no vector elements, just return the data as is
-  return $data if 1 == $col->{nelem};
+  return $data if 1 == $col->{nelem} || ! $attr{VecSplit};
 
   # deal with the vector elements
   my @vec_data;
   $#vec_data = $self->{nrows} - 1;
 
-  use integer;
+  # make special code; don't know yet if this is worth it
   my $dp = 0;
-  for ( my $idx = 0; $idx < $self->{nrows} ; $idx++, $dp += $col->nelem )
-  {
-    $vec_data[$idx] = [ @{$data}[$dp .. ($dp + $col->nelem-1) ] ] ;
-  }
-
+  my $dpd = $col->nelem;
+  my $dpd1 = $col->nelem - 1;
+  eval qq{
+    use integer;
+    for my \$idx ( 0..@{\$self->{nrows}}-1 )
+    {
+      \$vec_data[\$idx] = [ \@{\$data}[\$dp .. (\$dp + $dpd1) ] ] ;
+      \$dp += $dpd;
+    }
+  };
   return \@vec_data;
 }
 
@@ -331,7 +380,6 @@ sub read_col_col_array
 sub _read_next_col
 {
   my $self = shift;
-  my $row = shift;
 
   # if we're all done, don't bother
   return () if $self->{last_col_idx} + 1 == $self->{cols}->ncols;
@@ -369,7 +417,7 @@ sub _read_next_col
 sub read_row_row_array
 {
   my $self = shift;
-  $self->_read_next_row;
+  $self->_read_next_row( @_ );
 }
 
 
@@ -377,13 +425,14 @@ sub read_row_row_array
 sub read_row_row_hash
 {
   my $self = shift;
-  my $row = $self->_read_next_row;
+  my $row = shift || $self->{row_hash};
+
+  my $row_arr = $self->_read_next_row( $row );
 
   return undef unless $row;
 
-  my %row;
-  @row{ map { lc $_ } $self->{cols}->names } = @$row;
-  return \%row;
+  @{$row}{ map { lc $_ } $self->{cols}->names } = @$row_arr;
+  return $row;
 }
 
 # _read_row
@@ -397,14 +446,19 @@ sub _read_next_row
 {
   my $self = shift;
 
+  my %attr = ( VecSplit => 1, 
+	       ( @_ && 'HASH' eq ref($_[-1]) ? %{pop @_} : () ) );
+
+  # store the row data in what the caller wants, or the object's buffer.
+  my $row = shift || $self->{row_arr};
+
   # guess what? there's (possibly only sometimes) an extra row filled
   # with indefs at the end of the file! so we can't actually use
   # the end of file condition to stop reading.  ACKCKCKCCKKC!
   return undef if $self->{row} == $self->{nrows};
 
 
-  my $buf;
-  my $nread = read( $self->{fh}, $buf, $self->{row_len});
+  my $nread = read( $self->{fh}, $self->{buf}, $self->{row_len});
 
   unless( $nread == $self->{row_len} )
   {
@@ -416,27 +470,49 @@ sub _read_next_row
     return undef;
   }
 
-  my @data = unpack( $self->{row_extract}, $buf );
+  # if we're not splitting vectors up, just read into the final destination
+  my $data = $attr{VecSplit} ? $self->{data} : $row;
 
-  # this is slow, but it works. clean it up someday
-  my @row;
-  for my $col ( $self->{cols}->idxs )
+  # pre-extend.  should only hurt once
+  $#{$data} = $self->{row_els};
+  @{$data} = unpack( $self->{row_extract}, $self->{buf} );
+
+  if ( $attr{VecSplit} )
   {
-    if ( $col->nelem == 1 )
+    # this is slow, but it works. clean it up someday
+
+    # prextend the row.  should only hurt once.
+    $#{$row} = $self->{cols}->ncols;
+    @$row = ();
+    for my $col ( $self->{cols}->cols )
     {
-      my $data = shift @data;
-      push @row, $col->is_indef($data) ? undef : $data;
+      if ( $col->nelem == 1 )
+      {
+	my $elem = shift @$data;
+	push @$row, $col->is_indef($elem) ? undef : $elem;
+      }
+      else
+      {
+	push @$row, 
+	[ map { $col->is_indef($_) ? undef : $_ } 
+	  splice( @$data, 0, $col->nelem ) ];
+      }
     }
-    else
+  }
+  else
+  {
+    my $idx = 0;
+    for my $col ( $self->{cols}->cols )
     {
-      push @row, 
-         [ map { $col->is_indef($_) ? undef : $_ } 
-	               splice( @data, 0, $col->nelem ) ];
+      for ( my $nelem = $col->nelem; $nelem ; $nelem--, $idx++ )
+      {
+	$data->[$idx] = undef if $col->is_indef($data->[$idx]);
+      }
     }
   }
 
   $self->{row}++;
-  return \@row;
+  return $row;
 }
 
 
@@ -561,13 +637,33 @@ For example, to access the value of column C<time> in row 3,
 =item read_rows_array
 
   $rows = $tbl->read_rows_array;
+  $rows = $tbl->read_rows_array( \%attr );
 
 Digest the entire table.  This is called after B<open>. The table is
 stored as list of arrays, one array per row.
 
-For example, to access the value of column 9 in row 3,
+Vector elements are normally stored as references to arrays containing the
+data, e.g., if there are three columns, where the second column is a vector of length 3, C<$rows> may look like this:
 
-	$rows->[3][9]
+     $rows->[0] = [ e00, [ e01_0, e01_1, e01_2 ], e02 ]
+     $rows->[1] = [ e10, [ e11_0, e11_1, e11_2 ], e12 ]
+
+and
+
+     $rows->[0][2]
+
+extracts row 0, column 2.
+
+However, if the C<VecSplit> attribute is set to zero, vectors are left
+inlined in the data, and
+
+ $tbl->read_rows_array( { VecSplit => 0 } )
+
+results in:
+
+     $rows[0] = [ e00, e01_0, e01_1, e01_2, e02 ]
+     $rows[1] = [ e10, e11_0, e11_1, e11_2, e12 ]
+
 
 =item read_cols_hash
 
@@ -607,28 +703,81 @@ This method returns true if the table is stored in column order.
 =item read_col_col_array
 
   $col = $tbl->read_col_col_array;
+  $col = $tbl->read_col_col_array( \%attr );
 
 This reads the next column from a column ordered table into an array.
-It returns a reference to the array containing the data.  Vector
-elements are stored as references to arrays containing the data.
+It returns a reference to the array containing the data.  
 
-It returns undefined if it has reached the end of the data.
+Vector elements are normally stored as references to arrays containing
+the data, e.g.:
+
+     $col->[0] = [ e00, e01, e02 ]
+     $col->[1] = [ e10, e11, e12 ]
+     $col->[2] = [ e20, e21, e22 ]
+
+However, if the C<VecSplit> attribute is set to zero, they
+are left inlined in the data:
+
+ $tbl->read_col_col_array( { VecSplit => 0 } )
+
+results in:
+
+    $col->[0] = e00
+    $col->[1] = e01
+    $col->[2] = e02
+    $col->[3] = e10
+    ...
+
+This is faster, as the data are originally stored in this format.
+
+The method returns the undefined value if it has reached the end of
+the data.
 
 
 =item read_row_row_array
 
   $row = $tbl->read_row_row_array;
+  $row = $tbl->read_row_row_array( \%attr );
+
+  $tbl->read_row_row_array( \@row );
+  $tbl->read_row_row_array( \@row, \%attr );
 
 This reads the next row from a row-ordered table into an array, in the
-same order as that of the columns in the table.  Vector elements are
-stored as references to arrays containing the data.
+same order as that of the columns in the table.
 
 It returns the undefined value if there are no more data.
 
+By default it reads the data into an array which is reused for each
+row.  The caller may optionally pass in a reference to an array to be
+filled.
+
+Vector elements are normally stored as references to arrays containing the
+data, e.g.: 
+
+     $row->[0] = e0
+     $row->[1] = [ e10, e11, e12 ]
+     $row->[2] = e2
+
+However, if the C<VecSplit> attribute is set to zero, they
+are left inlined in the data:
+
+ $tbl->read_row_row_array( { VecSplit => 0 } )
+
+results in:
+
+    $row->[0] = e0
+    $row->[1] = e10
+    $row->[2] = e11
+    $row->[3] = e12
+    $row->[4] = e2
+    ...
+
+This is faster, as the data are originally stored in this format.
 
 =item read_row_row_hash
 
-  $row = $tbl->read_row_row_hash
+  $row = $tbl->read_row_row_hash;
+  $tbl->read_row_row_hash( \%row );
 
 This reads the next row from a row-ordered table into a hash, keyed
 off of the column names.  Vector elements are stored as references to
@@ -636,6 +785,8 @@ arrays containing the data.
 
 It returns the undefined value if there are no more data.
 
+By default it reads the data into a hash which is reused for each row.
+The caller may optionally pass in a reference to a hash to be filled.
 
 =item read_col_row_hash
 
@@ -654,11 +805,30 @@ This routine is seldom (if ever) called by an application.
 =item read_col_row_array
 
   $tbl->read_col_row_array( \@rows) ;
+  $tbl->read_col_row_array( \@rows, \%attr) ;
 
 This reads the next column from a column ordered table.  The data are
 stored in an array of arrays, one array per row.  The passed array ref
-is to that array of arrays.  Vector elements are stored as references
-to arrays containing the data.
+is to that array of arrays.  
+
+Vector elements are normally stored as references to arrays containing the
+data, e.g., after reading in three columns, C<@rows> might look like this:
+
+     $rows[0] = [ e00, [ e01_0, e01_1, e01_2 ], e02 ]
+     $rows[1] = [ e10, [ e11_0, e11_1, e11_2 ], e12 ]
+
+where the second column is a vector of length 3.  If the C<VecSplit>
+attribute is set to zero, vectors are left inlined in the data:
+
+ $tbl->read_col_row_array(\@rows, { VecSplit => 0 } )
+
+results in:
+
+     $rows[0] = [ e00, e01_0, e01_1, e01_2, e02 ]
+     $rows[1] = [ e10, e11_0, e11_1, e11_2, e12 ]
+
+This is probably a bit faster, as the data are read in in this
+fashion.
 
 It returns undefined if it has reached the end of the data.
 
@@ -681,6 +851,13 @@ Reading of column-ordered tables is untested.
 =item *
 
 Reading of tables with vector elements is untested.
+
+=item *
+
+Do I<not> delete or add columns by manipulating the table's 
+C<cols> attribute.  This will only confuse the table reader,
+as it assumes a one-to-one mapping between what's in the
+list of columns and what's in the table.
 
 =back
 

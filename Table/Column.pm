@@ -105,6 +105,11 @@ sub is_indef
   $_[0]->{type} != TY_STRING && $_[0]->{indef} == $_[1];
 }
 
+sub is_vector
+{
+  $_[0]->{type} != TY_STRING && $_[0]->{nelem} > 1;
+}
+
 sub nelem
 {
   croak( __PACKAGE__, "->nelem: attempt to write to RO attribute" )
@@ -224,8 +229,6 @@ B<Astro::STSDAS::Table::Columns> object.
 
 =item is_string
 
-  $is_string = $col->is_string;
-
 This returns true if the column is a string column.
 
 =item is_indef
@@ -234,6 +237,10 @@ This returns true if the column is a string column.
 
 This determines if the passed value matches the undefined value appropriate
 to the column.
+
+=item is_vector
+
+Returns true if the column's elements are vectors.
 
 =item nelem
 
